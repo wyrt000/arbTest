@@ -15,9 +15,8 @@ import sys
 import os
 import io
 import time
-import csv
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Optional, Set
+from typing import List, Tuple, Optional, Set
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
@@ -27,7 +26,6 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 DB_PATH = os.path.join(PROJECT_ROOT, 'database', 'arb_master.db')
-FUND_LIST_CSV = os.path.join(PROJECT_ROOT, 'jsl', 'fund_list.csv')
 TDX_UTILS_DIR = os.path.join(PROJECT_ROOT, 'jsl')
 DEFAULT_START = '2025-01-01'
 
@@ -36,7 +34,7 @@ DEFAULT_START = '2025-01-01'
 #
 # tqcenter符号格式:  code.SZ (深圳), code.SH (上海), code.HI (港股)
 #
-# 来源：fund_list.csv 中所有基金的"指数代码"列
+# 来源：数据库 unified_fund_list 表 related_index 字段
 # ============================================================
 
 # 美股ETF/指数 — 不通过TDX获取，跳过
@@ -243,29 +241,6 @@ def map_csv_index_to_tq(raw_code: str) -> Tuple[Optional[str], str]:
     return None, f'未识别: {code}'
 
 
-def parse_fund_list_csv() -> Dict[str, dict]:
-    """
-    解析 fund_list.csv，返回 {基金代码: {name, index_code, index_name, category}}
-    """
-    funds = {}
-    with open(FUND_LIST_CSV, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            fund_code = row.get('代码', '').strip()
-            if not fund_code:
-                continue
-            idx_code = row.get('指数代码', '').strip()
-            if not idx_code or idx_code == '-':
-                continue
-            funds[fund_code] = {
-                'name': row.get('名称', '').strip(),
-                'index_code': idx_code,
-                'index_name': row.get('相关指数', '').strip(),
-                'category': row.get('分类', '').strip(),
-            }
-    return funds
-
-
 def get_all_indices_from_db() -> List[str]:
     """从数据库 unified_fund_list 获取所有 related_index"""
     conn = sqlite3.connect(DB_PATH)
@@ -431,31 +406,15 @@ def main():
             return
     
     # ========================================================
-    # 收集所有需要补采的指数
+    # 收集所有需要补采的指数（唯一来源：数据库 unified_fund_list）
     # ========================================================
-    # 来源1: CSV fund_list.csv
-    csv_funds = parse_fund_list_csv()
-    csv_indices = {}
-    for fc, info in csv_funds.items():
-        idx = info['index_code']
-        if idx and idx != '-':
-            csv_indices[idx] = info
-    
-    # 来源2: 数据库 unified_fund_list
-    db_indices = get_all_indices_from_db()
-    
-    # 合并（去重）
-    all_raw_indices = set()
-    for idx in csv_indices:
-        all_raw_indices.add(idx)
-    for idx in db_indices:
-        all_raw_indices.add(idx)
+    all_raw_indices = set(get_all_indices_from_db())
     
     print("=" * 72)
     print("TDX 指数历史数据补采 (tqcenter)")
     print(f"日期范围: {start_date} ~ {end_date}")
     print("=" * 72)
-    print(f"\n共发现 {len(all_raw_indices)} 个唯一指数代码（CSV + 数据库）")
+    print(f"\n共发现 {len(all_raw_indices)} 个唯一指数代码（来源：数据库 unified_fund_list）")
     
     # ========================================================
     # 映射到 tqcenter 符号

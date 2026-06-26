@@ -3,7 +3,6 @@
  * 实时沙盘 (Analysis.vue) 和 懒人页面 (LazyMode.vue) 共用
  */
 import { useMessage, useDialog } from 'naive-ui'
-import { placeOrder } from '../api/tradingApi'
 import { addTrade } from '../api/ledgerApi'
 
 export function useOrderLogic() {
@@ -55,11 +54,14 @@ export function useOrderLogic() {
   }
 
   // ========== IB 下单函数（共用） ==========
-  const sendIbOrder = async (action, tradeEtf, hedgePrice, hedgeVol) => {
+  // mode: 'safe' = 保守吃买一, 'peg' = 内卷减一分排队
+  const sendIbOrder = async (action, tradeEtf, hedgePrice, hedgeVol, fundCode, mode = 'safe') => {
     if (!tradeEtf) {
       message.warning('未检测到交易标的')
       return
     }
+    
+    const modeName = mode === 'peg' ? '🤺 减一分排队' : '🛡️ 立即吃买一'
     
     dialog.warning({
       title: '确认下单',
@@ -73,14 +75,28 @@ export function useOrderLogic() {
       onPositiveClick: async () => {
         message.loading('正在发送委托指令，请稍候...')
         try {
-          const res = await placeOrder({ action, code: tradeEtf, volume: hedgeVol, price: hedgePrice, broker: 'ib' })
+          // [AI-2026-06-26] IB 下单改为走 LazyTrader lazy_place_order API
+          const { default: client } = await import('../api/client')
+          const payload = {
+            mode: mode,
+            direction: action === 'BUY' ? 'close' : 'open',
+            fund_code: fundCode || '162411',
+            underlying_symbol: tradeEtf,
+            quantity: 0,
+            etf_quantity: hedgeVol,
+            price: hedgePrice,
+            lof_price: 0,
+          }
+          console.log('[sendIbOrder] payload:', payload)
+          const res = await client.post('/api/private/lazy_place_order', payload)
+          console.log('[sendIbOrder] response:', res.data)
           if (res.data.status === 'ok') {
-            message.success(`下单结果: ${res.data.message}`)
+            message.success(`${modeName} IB下单成功: ${JSON.stringify(res.data.data || res.data)}`)
           } else {
-            message.error(`下单失败: ${res.data.message}`)
+            message.error(`IB下单失败: ${res.data.message || JSON.stringify(res.data)}`)
             dialog.error({
-              title: '下单失败',
-              content: `券商/通道接口返回错误: ${res.data.message}`,
+              title: 'IB下单失败',
+              content: `券商/通道接口返回错误: ${res.data.message || JSON.stringify(res.data)}`,
             })
           }
         } catch (e) {

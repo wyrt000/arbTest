@@ -463,22 +463,33 @@ class DailyUpdater(BaseApp):
         """步骤四：抓取各基金的净值和收盘价"""
         self.logger.info("=== 步骤四：抓取各基金最新净值和收盘价 (标准库模式) ===")
         today_str = datetime.now().strftime('%Y-%m-%d')
-        current_hour = datetime.now().hour
 
-        # 从大一统基金列表获取所有基金代码（覆盖 QDII亚洲/国内LOF/债券货币等 lof_config.yaml 未收录的品种）
+        # 从大一统基金列表获取所有基金代码+分类
         conn_ufl = self.db._get_conn()
-        all_fund_rows = conn_ufl.execute("SELECT fund_code FROM unified_fund_list").fetchall()
+        all_fund_rows = conn_ufl.execute("SELECT fund_code, category FROM unified_fund_list").fetchall()
         conn_ufl.close()
-        all_codes = [str(r[0]) for r in all_fund_rows if r[0]]
+        # 构建 code → category 映射
+        fund_categories = {str(r[0]): (r[1] or '') for r in all_fund_rows if r[0]}
+        all_codes = list(fund_categories.keys())
         self.logger.info(f"📋 unified_fund_list 共 {len(all_codes)} 只基金，开始遍历净值/价格同步...")
+
+        # 净值预期规则：海外品种（黄金原油/QDII欧美/混合跨境）T-2最新，国内/亚洲 T-1最新
+        T2_CATEGORIES = {'黄金原油', 'QDII欧美', '混合跨境'}
 
         for code in all_codes:
             if not code: continue
                 
-            # --- 1. 获取收盘价和成交额 (新浪实时行情接口) ---
+            # --- 1. 获取收盘价和成交额 ---
+            # [AI-2026-06-26] 修复收盘价BUG：原代码用Sina fields[3]（当前价）当收盘价，
+            # 盘中运行时拿到的是盘中价非真实收盘价。修正为fields[2]（昨收=已确认收盘价）。
             if not self.db.is_access_synced_today(today_str, source=f'lof_price_{code}'):
-                # 新浪实时行情接口获取成交额
                 import requests
+                # 计算上一个交易日日期
+                prev_td = datetime.now() - timedelta(days=1)
+                while prev_td.weekday() >= 5:
+                    prev_td -= timedelta(days=1)
+                prev_td_str = prev_td.strftime('%Y-%m-%d')
+
                 sina_code = f"sz{code}" if code.startswith(('0', '1', '3')) else f"sh{code}"
                 url = f"https://hq.sinajs.cn/list={sina_code}"
                 headers = {
@@ -492,15 +503,18 @@ class DailyUpdater(BaseApp):
                         data_part = resp.text.split('="')[1].split('";')[0]
                         fields = data_part.split(",")
                         if len(fields) > 9:
-                            price = float(fields[3])  # 开盘价
-                            amount_yuan = float(fields[9])  # 成交额(元)
-                            amount_wan = round(amount_yuan / 10000, 2)  # 成交额(万元)，保留2位小数
-                            self._safe_save_fund_data(date_str=today_str, fund_code=code, price=price)
-                            self.db.save_unified_history(date_str=today_str, fund_code=code, volume=amount_wan)
+                            # fields[2]=昨收（已确认收盘价），不用fields[3]（当前价=盘中可能是实时价）
+                            price = float(fields[2])
+                            amount_yuan = float(fields[9])
+                            amount_wan = round(amount_yuan / 10000, 2)
+                            self._safe_save_fund_data(date_str=prev_td_str, fund_code=code, price=price)
+                            self.db.save_unified_history(date_str=prev_td_str, fund_code=code, volume=amount_wan)
                             self.db.mark_access_synced(today_str, source=f'lof_price_{code}')
-                            self.logger.info(f"✅ [{code}] 历史价格同步完成: 价格={price}, 成交额={amount_wan}万元")
+                            self.logger.info(f"✅ [{code}] 收盘价(Sina昨收): 日期={prev_td_str}, 价格={price}, 成交额={amount_wan}万元")
+                    else:
+                        self.logger.warning(f"⚠️ [{code}] Sina返回空数据")
                 except Exception as e:
-                    self.logger.error(f"❌ [{code}] 新浪接口获取失败: {e}")
+                    self.logger.error(f"❌ [{code}] Sina获取收盘价失败: {e}")
 
             # --- 2. 获取东财净值 ---
             def get_prev_trading_day(dt):
@@ -511,8 +525,12 @@ class DailyUpdater(BaseApp):
             t_1_date = get_prev_trading_day(datetime.now())
             t_2_date = get_prev_trading_day(t_1_date)
             
-            # 15:00之前预期只有T-2的净值，15:00之后预期会有T-1的净值
-            expected_nav_date = t_2_date.strftime('%Y-%m-%d') if current_hour < 15 else t_1_date.strftime('%Y-%m-%d')
+            # 按分类决定预期净值日期：海外品种T-2最新，国内/亚洲T-1最新
+            category = fund_categories.get(code, '')
+            if category in T2_CATEGORIES:
+                expected_nav_date = t_2_date.strftime('%Y-%m-%d')
+            else:
+                expected_nav_date = t_1_date.strftime('%Y-%m-%d')
             
             conn = self.db._get_conn()
             cursor = conn.cursor()
@@ -523,10 +541,8 @@ class DailyUpdater(BaseApp):
             db_max_nav_date = max_nav_row[0] if max_nav_row and max_nav_row[0] else "2000-01-01"
             
             if db_max_nav_date >= expected_nav_date:
-                if current_hour < 15:
-                    self.logger.info(f"⏳ [{code}] 当前未到15:00，T-1净值未发。本地已拥有T-2及之前最新净值({db_max_nav_date})，暂不请求东财。")
-                else:
-                    self.logger.info(f"✅ [{code}] 数据库已存在预期最新净值 ({db_max_nav_date})，跳过东财接口...")
+                nav_label = 'T-2' if category in T2_CATEGORIES else 'T-1'
+                self.logger.info(f"✅ [{code}] 数据库已有{nav_label}净值 ({db_max_nav_date})，跳过东财接口...")
                 self.db.mark_access_synced(today_str, source=f'lof_nav_{code}')
                 continue
                 
@@ -542,6 +558,15 @@ class DailyUpdater(BaseApp):
                     self.db.mark_access_synced(today_str, source=f'lof_nav_{code}')
             else:
                 self.logger.warning(f"⚠️ [{code}] 东财接口未返回任何净值数据。")
+
+    def step4_5_sync_fund_purchase_status(self):
+        """步骤4.5：从 AKShare 同步基金申赎状态"""
+        self.logger.info("=== 步骤4.5：同步基金申购赎回状态 (AKShare) ===")
+        try:
+            from arbcore.fetchers.data_fetcher import data_fetcher
+            data_fetcher.sync_akshare_fund_status(self.db)
+        except Exception as e:
+            self.logger.error(f"❌ 申赎状态同步失败: {e}")
 
     def step5_fetch_usa_market_data(self):
         """步骤五：抓取美股市场交易数据"""
@@ -1097,6 +1122,7 @@ class DailyUpdater(BaseApp):
         self.step2_5_sync_yaml_with_latest_factors()
         self.step3_fetch_exchange_rate()
         self.step4_fetch_lof_market()
+        self.step4_5_sync_fund_purchase_status()
         self.step5_fetch_usa_market_data()
         self.step7_fetch_extra_calibrations()
         self.step8_fetch_sina_futures_from_vps()
